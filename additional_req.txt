@@ -1,0 +1,150 @@
+You are a senior Data Engineer. Implement a metadata-driven control plane and ingestion module to support adding multiple OpenSearch sources (multi-client/partner) into an existing ClickHouse DW (bronze→gold star schema already correct) with minimal downtime and without repeated code edits.
+
+Current system (already exists in repo):
+- Single-VM deployment using Docker Compose.
+- Postgres is used for metadata/control.
+- ClickHouse is the centralized data warehouse.
+- Airflow runs SQL pipelines bronze→gold (star schema).
+- Superset and CHouse UI already exist.
+- The gold star schema fields/structure are already correct.
+
+Main goals (must):
+1) Add new OpenSearch sources modularly (many clients/partners) without editing code per source.
+2) Support backfill + incremental loads from OpenSearch with checkpointing.
+3) Add custom fields flexibly:
+   - Keep core schema stable (existing bronze/gold stays).
+   - Store raw JSON in bronze.
+   - Allow new fields defined via metadata (Field Registry) and applied to ClickHouse safely (DDL idempotent).
+4) Minimize downtime:
+   - Adding a new source/field must not require restarting ClickHouse/Airflow.
+   - All schema changes use ADD COLUMN IF NOT EXISTS and are safe to run repeatedly.
+
+Implementation approach:
+- Add a Control Plane in Postgres (metadata tables).
+- Add a generic OpenSearch Puller worker that reads metadata and ingests into ClickHouse bronze.
+- Add a minimal Source Manager UI (FastAPI + simple HTML OR Streamlit) for onboarding sources and defining custom fields.
+- Add a Schema Migrator component driven by Field Registry.
+- Keep changes incremental; do not introduce heavy infra (no Kubernetes). All DDL idempotent.
+
+Deliverables:
+
+A) Postgres metadata schema (DDL + migrations)
+Create tables (in schema 'metadata' or 'control', consistent with existing repo):
+- projects(project_id, name, enabled, created_at, updated_at, timezone, retention_days)
+- opensearch_sources(
+    source_id, project_id, name,
+    base_url, auth_type, username,
+    secret_enc OR secret_ref,
+    index_pattern, time_field, query_filter_json,
+    enabled, created_at, updated_at
+  )
+- ingestion_state(
+    source_id, index_name,
+    last_ts, last_sort_json, last_id,
+    status, last_error, updated_at
+  )
+- backfill_jobs(
+    job_id, source_id, start_ts, end_ts,
+    status, requested_by, created_at, updated_at, last_error
+  )
+- field_registry(
+    field_id, project_id (nullable for global),
+    dataset (wazuh/suricata/zeek/generic),
+    layer (bronze/gold_fact/gold_dim),
+    table_name, column_name, column_type,
+    expression_sql (ClickHouse expression, often JSONExtract* from raw),
+    mode (ALIAS|MATERIALIZED, default ALIAS),
+    enabled, created_at, updated_at
+  )
+
+Secrets:
+- Implement one simple approach:
+  Option 1: store encrypted secrets in Postgres using pgcrypto with a master key from env.
+  OR Option 2: store secret_ref pointing to Docker secret file paths.
+- Document the chosen approach in README.
+
+B) ClickHouse multi-project conventions + idempotent provisioning
+We want BigQuery-like "project switching":
+- For each project_id create databases:
+  <project_id>_bronze and <project_id>_gold
+- Ensure a generic bronze table for OpenSearch ingestion exists:
+  <project_id>_bronze.os_events_raw
+    event_id String,
+    event_ts DateTime64(3),
+    index_name String,
+    source_id String,
+    raw String,
+    ingested_at DateTime64(3),
+    extras Map(String, String) DEFAULT map()
+  ENGINE MergeTree
+  PARTITION BY toDate(event_ts)
+  ORDER BY (source_id, toDate(event_ts), event_ts, event_id)
+
+Also: update existing bronze raw tables (if present) to include:
+- raw String (the original JSON)
+- extras Map(String, String)
+using ALTER TABLE ... ADD COLUMN IF NOT EXISTS.
+
+C) OpenSearch Puller service (Python) - generic ingestion worker
+Create services/opensearch_puller (production-grade):
+- Poll enabled sources from Postgres.
+- Resolve index list from index_pattern.
+- Fetch documents from OpenSearch using stable pagination:
+  Prefer PIT + search_after with sort by (time_field asc, _id asc). Avoid scroll for incremental.
+- Support:
+  1) Backfill: process rows in backfill_jobs (start_ts/end_ts), update job status.
+  2) Incremental: use ingestion_state checkpoint; use overlap window (configurable, e.g., 10 minutes) to handle late events.
+- Insert into ClickHouse using INSERT ... FORMAT JSONEachRow to <project_id>_bronze.os_events_raw.
+- Batch, retry with exponential backoff, optional rate limiting.
+- Update ingestion_state reliably after successful batch.
+- Idempotency: duplicate inserts should not break; assume gold can dedup or implement minimal dedup strategy (avoid heavy redesign).
+
+Config via env:
+- POSTGRES_DSN
+- CLICKHOUSE_HTTP_URL
+- BATCH_SIZE
+- OVERLAP_MINUTES
+- POLL_INTERVAL_SECONDS
+- LOG_LEVEL
+
+D) Field Registry + Schema Migrator
+Implement a component (CLI or service) that:
+- Reads enabled field_registry rows
+- Applies ClickHouse schema changes safely:
+  ALTER TABLE <db>.<table> ADD COLUMN IF NOT EXISTS <column_name> <column_type>
+- If expression_sql is set:
+  - Default to create ALIAS column.
+  - Allow MATERIALIZED when mode=MATERIALIZED.
+- Must be idempotent and safe to run repeatedly.
+- Provide a command:
+  python -m schema_migrator apply
+
+E) Source Manager UI/API
+Implement a minimal UI for admin onboarding:
+- Create/update projects
+- Add/update OpenSearch sources (base_url, auth, index_pattern, time_field, optional query_filter_json)
+- Trigger backfill job (start_ts, end_ts)
+- Add custom fields to field_registry and apply schema (call schema migrator)
+Keep it minimal but functional.
+
+F) Docker Compose updates
+Add services:
+- opensearch-puller
+- source-manager
+If needed add schema-migrator as a one-shot container or run from puller image.
+Use restart policies and health checks.
+No breaking changes to existing services.
+
+G) Documentation
+Update README with:
+- How to add a new project
+- How to add a new OpenSearch source
+- How to run backfill
+- How to add a custom field via Field Registry
+- Troubleshooting (auth errors, PIT/search_after issues, ClickHouse insert errors)
+
+Output requirement:
+- Provide the new/changed files with clear directory structure.
+- Provide docker-compose.yml updates (diff or full file).
+- Provide Postgres and ClickHouse DDL/migrations.
+- Ensure everything is runnable on a single VM with docker compose.
